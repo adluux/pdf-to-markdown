@@ -269,6 +269,9 @@
           body: JSON.stringify({ filename: f.name, data: f.data })
         });
         const json = await res.json();
+        if (!res.ok) {
+          throw new Error(json.error || `Request failed with status ${res.status}`);
+        }
         f.markdown = json.markdown;
         f.status = "done";
       } catch (err) {

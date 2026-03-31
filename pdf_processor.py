@@ -1,148 +1,144 @@
-import fitz  # PyMuPDF
+import re
+from collections import Counter
 from pathlib import Path
 
+import pypdf
 
-def convert_pdf_to_markdown(pdf_path: str) -> str:
-    doc = fitz.open(pdf_path)
-    parts = []
 
-    title = Path(pdf_path).stem.replace("-", " ").replace("_", " ").title()
-    parts.append(f"# {title}\n")
+def convert_pdf_to_markdown(pdf_path: str, title: str | None = None) -> str:
+    reader = pypdf.PdfReader(pdf_path)
+    pages = reader.pages
 
-    for page_num, page in enumerate(doc, 1):
-        if len(doc) > 1:
+    all_spans = []
+    page_spans = []
+
+    for page in pages:
+        spans = []
+
+        def visitor(text, cm, tm, font_dict, font_size):
+            if not text or not text.strip():
+                return
+            # Actual rendered size comes from the transform matrix
+            size = abs(tm[3]) if tm and tm[3] else (font_size or 12)
+            font_name = ""
+            if font_dict:
+                font_name = str(font_dict.get("/BaseFont", ""))
+            spans.append({
+                "text": text,
+                "size": round(float(size), 1),
+                "font": font_name,
+                "x": tm[4] if tm else 0,
+                "y": tm[5] if tm else 0,
+            })
+
+        page.extract_text(visitor_text=visitor)
+        page_spans.append(spans)
+        all_spans.extend(spans)
+
+    body_size = _detect_body_size(all_spans)
+    thresholds = _compute_thresholds(body_size)
+
+    document_title = title or Path(pdf_path).stem
+    document_title = document_title.replace("-", " ").replace("_", " ").strip().title()
+    parts = [f"# {document_title}\n"]
+
+    for page_num, spans in enumerate(page_spans, 1):
+        if len(page_spans) > 1:
             parts.append(f"\n---\n\n## Page {page_num}\n")
 
-        blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
-        font_sizes = _collect_font_sizes(blocks)
-        heading_thresholds = _compute_heading_thresholds(font_sizes)
+        lines = _group_into_lines(spans)
+        for line_spans in lines:
+            md = _format_line(line_spans, thresholds, body_size)
+            if md:
+                parts.append(md)
 
-        prev_was_heading = False
-        for block in blocks:
-            if block["type"] == 1:
-                parts.append("\n*[Image]*\n")
-                prev_was_heading = False
-                continue
-
-            if block["type"] != 0:
-                continue
-
-            text, is_heading = _process_block(block, heading_thresholds)
-            if not text:
-                continue
-
-            if is_heading and not prev_was_heading:
-                parts.append("")
-            parts.append(text)
-            if is_heading:
-                parts.append("")
-
-            prev_was_heading = is_heading
-
-    doc.close()
     return "\n".join(parts)
 
 
-def _collect_font_sizes(blocks: list) -> list:
-    sizes = []
-    for block in blocks:
-        if block["type"] != 0:
-            continue
-        for line in block["lines"]:
-            for span in line["spans"]:
-                if span["text"].strip():
-                    sizes.append(round(span["size"], 1))
-    return sizes
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _detect_body_size(spans: list) -> float:
+    sizes = [round(s["size"], 1) for s in spans if s["size"] > 0]
+    if not sizes:
+        return 11.0
+    return Counter(sizes).most_common(1)[0][0]
 
 
-def _compute_heading_thresholds(font_sizes: list) -> dict:
-    if not font_sizes:
-        return {"h1": 999, "h2": 999, "h3": 999}
-
-    body_size = _mode(font_sizes)
-    unique_large = sorted(set(s for s in font_sizes if s > body_size * 1.1), reverse=True)
-
-    h1 = unique_large[0] if len(unique_large) >= 1 else 999
-    h2 = unique_large[1] if len(unique_large) >= 2 else 999
-    h3 = unique_large[2] if len(unique_large) >= 3 else 999
-
-    return {"h1": h1, "h2": h2, "h3": h3, "body": body_size}
+def _compute_thresholds(body: float) -> dict:
+    return {
+        "h1": body * 1.8,
+        "h2": body * 1.4,
+        "h3": body * 1.15,
+        "body": body,
+    }
 
 
-def _mode(values: list):
-    from collections import Counter
-    return Counter(values).most_common(1)[0][0]
+def _group_into_lines(spans: list) -> list:
+    if not spans:
+        return []
+    sorted_spans = sorted(spans, key=lambda s: (-round(s["y"], 0), s["x"]))
+    lines = []
+    current = [sorted_spans[0]]
+    for span in sorted_spans[1:]:
+        if abs(span["y"] - current[-1]["y"]) < 3:
+            current.append(span)
+        else:
+            lines.append(current)
+            current = [span]
+    lines.append(current)
+    return lines
 
 
-def _process_block(block: dict, thresholds: dict) -> tuple:
-    lines_out = []
-    block_sizes = []
-    block_flags = []
+def _format_line(spans: list, thresholds: dict, body_size: float) -> str:
+    if not spans:
+        return ""
 
-    for line in block["lines"]:
-        line_parts = []
-        for span in line["spans"]:
-            raw = span["text"]
-            if not raw.strip():
-                line_parts.append(raw)
-                continue
-            flags = span["flags"]
-            size = round(span["size"], 1)
-            block_sizes.append(size)
-            block_flags.append(flags)
+    sizes = [s["size"] for s in spans if s["size"] > 0]
+    avg_size = sum(sizes) / len(sizes) if sizes else body_size
 
-            is_bold = bool(flags & (1 << 4))
-            is_italic = bool(flags & (1 << 1))
+    text = " ".join(s["text"].strip() for s in spans if s["text"].strip())
+    if not text:
+        return ""
 
-            text = raw
-            if is_bold and is_italic:
-                text = f"***{text.strip()}***"
-            elif is_bold:
-                text = f"**{text.strip()}**"
-            elif is_italic:
-                text = f"*{text.strip()}*"
+    # Detect bullet list
+    stripped = text.lstrip()
+    if stripped and stripped[0] in "•·◦▪▸►✓✗–—-" and len(stripped) > 2:
+        return f"- {stripped[1:].strip()}"
+    if re.match(r"^\d+[.)]\s", stripped):
+        return text
 
-            line_parts.append(text)
-
-        joined = "".join(line_parts).strip()
-        if joined:
-            lines_out.append(joined)
-
-    if not lines_out:
-        return "", False
-
-    full_text = " ".join(lines_out)
-
-    # Detect list items
-    stripped = full_text.lstrip()
-    if stripped.startswith(("•", "·", "◦", "▪", "▸", "►", "✓", "✗")):
-        return f"- {stripped[1:].strip()}", False
-    if _is_numbered_list(stripped):
-        return full_text, False
-
-    # Heading detection
-    avg_size = sum(block_sizes) / len(block_sizes) if block_sizes else 0
-
+    # Headings by size
     if avg_size >= thresholds["h1"]:
-        return f"# {_strip_formatting(full_text)}", True
+        return f"\n# {text}\n"
     if avg_size >= thresholds["h2"]:
-        return f"## {_strip_formatting(full_text)}", True
+        return f"\n## {text}\n"
     if avg_size >= thresholds["h3"]:
-        return f"### {_strip_formatting(full_text)}", True
+        return f"\n### {text}\n"
 
-    # Bold-only short line as heading fallback
-    if block_flags and all(bool(f & (1 << 4)) for f in block_flags):
-        body = thresholds.get("body", 0)
-        if avg_size >= body and len(full_text) < 120:
-            return f"#### {_strip_formatting(full_text)}", True
+    # Bold font as subheading
+    all_bold = spans and all(
+        "bold" in s["font"].lower() or "heavy" in s["font"].lower()
+        for s in spans if s["text"].strip()
+    )
+    if all_bold and len(text) < 120 and avg_size >= body_size:
+        return f"\n#### {text}\n"
 
-    return full_text, False
+    # Inline bold/italic formatting
+    parts = []
+    for span in spans:
+        t = span["text"].strip()
+        if not t:
+            continue
+        font = span["font"].lower()
+        bold = "bold" in font or "heavy" in font
+        italic = "italic" in font or "oblique" in font
+        if bold and italic:
+            parts.append(f"***{t}***")
+        elif bold:
+            parts.append(f"**{t}**")
+        elif italic:
+            parts.append(f"*{t}*")
+        else:
+            parts.append(t)
 
-
-def _strip_formatting(text: str) -> str:
-    return text.replace("***", "").replace("**", "").replace("*", "")
-
-
-def _is_numbered_list(text: str) -> bool:
-    import re
-    return bool(re.match(r"^\d+[.)]\s", text))
+    return " ".join(parts)
